@@ -1,0 +1,67 @@
+name: Build SmartPendant firmware
+
+# Runs on every push, on pull requests, and whenever you click "Run workflow"
+# in the Actions tab. Produces a downloadable SmartPendant.hex (and .bin/.elf).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:   # <-- the manual "Run workflow" button
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Get the repo INCLUDING submodules (DevCore UI lib comes in as one).
+      #    Without submodules the build fails with missing headers.
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 2) Install the ARM bare-metal compiler on the build machine.
+      #    This is GitHub's server, not yours - no admin on your side.
+      - name: Install arm-none-eabi-gcc toolchain
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '13.2.Rel1'   # a modern, widely-compatible toolchain
+
+      # 3) Install a current CMake (>= 4.0.0 as the README requires) + Ninja.
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+
+      # 4) Configure. The repo ships its own toolchain file; point CMake at it.
+      #    Release build = optimized (-Os), which matters on the F411's small RAM.
+      - name: Configure (CMake)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/arm_none_eabi_gcc.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      # 5) Compile everything.
+      - name: Build
+        run: cmake --build build --parallel
+
+      # 6) Some CMake setups emit only an .elf. Make sure we also have .hex/.bin
+      #    by converting whatever .elf got produced. Harmless if they already exist.
+      - name: Ensure .hex and .bin exist
+        run: |
+          ELF=$(find build -name '*.elf' | head -n 1)
+          echo "Found ELF: $ELF"
+          if [ -n "$ELF" ]; then
+            arm-none-eabi-objcopy -O ihex   "$ELF" build/SmartPendant.hex || true
+            arm-none-eabi-objcopy -O binary "$ELF" build/SmartPendant.bin || true
+          fi
+          echo "---- build artifacts ----"
+          find build \( -name '*.hex' -o -name '*.bin' -o -name '*.elf' \) -print
+
+      # 7) Upload the firmware so you can download it from the run's page.
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartPendant-firmware
+          if-no-files-found: error
+          path: |
+            build/**/*.hex
+            build/**/*.bin
+            build/**/*.elf
