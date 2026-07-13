@@ -2,98 +2,25 @@
 //  @file WrapJobScr.cpp
 //  @brief Wire Wrap guided-job screen for SmartPendant (grblHAL)
 //
-//  Design: all sequencing lives in the .nc job file on the CONTROLLER SD card
-//  (M0 pauses + (MSG,...) prompts). This screen is a thin, operator-friendly
-//  remote: pick job, press the big button, follow the prompts.
-//
-//  PORTING NOTE: everything that touches GrblComm goes through the
-//  "GRBL API ADAPTER" block right below the includes. If a method name in
-//  your checkout differs (compiler will tell you), fix it there and ONLY
-//  there. Open ProgramSender.cpp / ProbeScr.cpp side by side - they use the
-//  same calls with the project's real names.
+//  Streams a .nc job file line-by-line from SD (like ProgramSender). When a
+//  streamed line starts with "(MSG," the text is shown big on screen. Lines
+//  with M0 pause the controller; the operator taps CONTINUE (sends Run). No
+//  changes to GrblComm are required.
 //******************************************************************************
 
 // *****************************************************************************
 // ***   Includes   ************************************************************
 // *****************************************************************************
 #include "WrapJobScr.h"
+#include "Application.h"
 
+#include "fatfs.h"
+#include <cctype>
 #include <cstring>
 #include <cstdio>
 
 // *****************************************************************************
-// ***   GRBL API ADAPTER   ****************************************************
-// ***   Fix any name mismatches HERE ONLY.                                  ***
-// *****************************************************************************
-
-static inline GrblComm& Grbl(void) {return GrblComm::GetInstance();}
-
-// Pendant control of the machine (MPG mode on/off).
-// Alternatives seen in grblHAL pendants: GetMpgMode()/SetMpgMode(),
-// IsInControl()/GainControl(), RequestModeChange().
-static inline bool GrblInControl(void) {return Grbl().IsInControl();}
-static inline void GrblGainControl(void) {Grbl().GainControl();}
-
-// Simplified machine state for the wizard.
-enum GrblSimpleState {GS_UNKNOWN, GS_IDLE, GS_RUN, GS_HOLD, GS_ALARM, GS_OTHER};
-static GrblSimpleState GrblState(void)
-{
-  // Alternative enum spellings: STATE_IDLE, GRBL_STATE_IDLE, etc.
-  switch(Grbl().GetState())
-  {
-    case GrblComm::IDLE:  return GS_IDLE;
-    case GrblComm::RUN:   return GS_RUN;
-    case GrblComm::JOG:   return GS_RUN;
-    case GrblComm::HOLD:  return GS_HOLD;
-    case GrblComm::ALARM: return GS_ALARM;
-    default:              return GS_OTHER;
-  }
-}
-
-// Axis positions in current work coordinates. Axis order: X=0, Y=1, Z=2, A=3.
-// If your GrblComm returns positions via GetAxisPosition(axis) in units of
-// 0.001 (int32), divide by 1000.0f here.
-static inline float GrblPosX(void) {return Grbl().GetAxisPosition(0u);}
-static inline float GrblPosA(void) {return Grbl().GetAxisPosition(3u);}
-
-// Send a normal command line (terminator added by GrblComm if needed).
-static inline void GrblSendCmd(const char* cmd)
-{
-  uint32_t id = 0u;
-  Grbl().SendCmd(cmd, id); // alt: Grbl().SendCmd(cmd);
-}
-
-// Real-time single-byte commands (bypass the line buffer).
-// alt: Grbl().CycleStart(); Grbl().Hold(); Grbl().Reset();
-static inline void GrblCycleStart(void) {Grbl().SendRealTimeCmd('~');}
-static inline void GrblFeedHold(void)   {Grbl().SendRealTimeCmd('!');}
-static inline void GrblReset(void)      {Grbl().SendRealTimeCmd(0x18);}
-
-// *****************************************************************************
-// ***   Local helpers   *******************************************************
-// *****************************************************************************
-
-// Format a float as [-]int.frac with fixed decimals without requiring
-// printf float support (newlib-nano float printf may be disabled).
-static void FormatFixed(char* buf, uint32_t buf_len, float val, uint32_t decimals)
-{
-  int32_t mul = 1;
-  for(uint32_t i = 0u; i < decimals; i++) mul *= 10;
-  bool neg = (val < 0.0f);
-  int32_t v = (int32_t)((neg ? -val : val) * (float)mul + 0.5f);
-  if(decimals > 0u)
-  {
-    snprintf(buf, buf_len, "%s%ld.%0*ld", neg ? "-" : "",
-             (long)(v / mul), (int)decimals, (long)(v % mul));
-  }
-  else
-  {
-    snprintf(buf, buf_len, "%s%ld", neg ? "-" : "", (long)v);
-  }
-}
-
-// *****************************************************************************
-// ***   GetInstance   *********************************************************
+// ***   Get Instance   ********************************************************
 // *****************************************************************************
 WrapJobScr& WrapJobScr::GetInstance()
 {
@@ -102,122 +29,37 @@ WrapJobScr& WrapJobScr::GetInstance()
 }
 
 // *****************************************************************************
-// ***   GrblLineSink   ********************************************************
-// ***   Called from GrblComm task for EVERY received line (see the tiny    ***
-// ***   GrblComm patch in INTEGRATION.md). Keep this fast: buffers only,   ***
-// ***   no display calls.                                                  ***
+// ***   Private constructor: grab shared soft buttons (like ProgramSender)  **
 // *****************************************************************************
-void WrapJobScr::GrblLineSink(const char* line)
-{
-  WrapJobScr& scr = WrapJobScr::GetInstance();
-
-  // --- Step prompts: [MSG:....] --------------------------------------------
-  if(strncmp(line, "[MSG:", 5) == 0)
-  {
-    const char* p = line + 5;
-    // Copy payload up to ']' into a temp buffer
-    char tmp[2u * MSG_LINE_LEN];
-    uint32_t n = 0u;
-    while((*p != ']') && (*p != '\0') && (n < sizeof(tmp) - 1u)) tmp[n++] = *p++;
-    tmp[n] = '\0';
-
-    // Split into two display lines at the last space before char 38
-    uint32_t split = n;
-    if(n > 38u)
-    {
-      split = 38u;
-      for(uint32_t i = 38u; i > 20u; i--)
-      {
-        if(tmp[i] == ' ') {split = i; break;}
-      }
-    }
-    uint32_t l1 = (split < MSG_LINE_LEN - 1u) ? split : MSG_LINE_LEN - 1u;
-    memcpy(scr.msg_line1_buf, tmp, l1);
-    scr.msg_line1_buf[l1] = '\0';
-    if(split < n)
-    {
-      const char* rest = tmp + split + ((tmp[split] == ' ') ? 1u : 0u);
-      strncpy(scr.msg_line2_buf, rest, MSG_LINE_LEN - 1u);
-      scr.msg_line2_buf[MSG_LINE_LEN - 1u] = '\0';
-    }
-    else
-    {
-      scr.msg_line2_buf[0] = '\0';
-    }
-    scr.msg_updated = true;
-  }
-  // --- SD file list entries: [FILE:/name.nc|SIZE:123] -----------------------
-  else if(strncmp(line, "[FILE:", 6) == 0)
-  {
-    if(scr.file_cnt < MAX_FILES)
-    {
-      const char* p = line + 6;
-      if(*p == '/') p++;
-      char* dst = scr.file_names[scr.file_cnt];
-      uint32_t n = 0u;
-      while((*p != '|') && (*p != ']') && (*p != '\0') && (n < MAX_FNAME - 1u))
-      {
-        dst[n++] = *p++;
-      }
-      dst[n] = '\0';
-      if(n > 0u)
-      {
-        scr.file_cnt++;
-        if(scr.file_idx < 0) scr.file_idx = 0;
-      }
-    }
-  }
-  else
-  {
-    ; // all other lines: not ours
-  }
-}
+WrapJobScr::WrapJobScr() : left_btn(Application::GetInstance().GetLeftButton()),
+                           middle_btn(Application::GetInstance().GetMiddleButton()),
+                           right_btn(Application::GetInstance().GetRightButton()) {};
 
 // *****************************************************************************
 // ***   Setup   ***************************************************************
 // *****************************************************************************
 Result WrapJobScr::Setup(int32_t y, int32_t height)
 {
-  scr_y = y;
-  scr_h = height;
-  int32_t w = display_drv.GetScreenW(); // DevCore display driver instance
-                                        // (declared in DevCfg.h in stock code)
+  // Fill menu_items (same as ProgramSender)
+  for(uint32_t i = 0u; i < NumberOf(menu_items); i++)
+  {
+    menu_items[i].text = str[i];
+    menu_items[i].n = sizeof(str[i]);
+  }
+  menu.SetCallback(AppTask::GetCurrent(), this,
+                   reinterpret_cast<CallbackPtr>(ProcessMenuOkCallback),
+                   reinterpret_cast<CallbackPtr>(ProcessMenuCancelCallback));
+  menu.Setup(menu_items, NumberOf(menu_items), 0, y, display_drv.GetScreenW(),
+             height - Font_8x12::GetInstance().GetCharH() * 2u - BORDER_W * 2);
 
-  // --- Row 1: state banner (left) -------------------------------------------
-  strcpy(state_str_buf, "WIRE WRAP");
-  state_str.SetParams(state_str_buf, 8, y + 4, COLOR_CYAN, String::FONT_12x16);
+  int32_t w = display_drv.GetScreenW();
 
-  // --- Row 2: job file selector < name > ------------------------------------
-  btn_prev.SetParams("<", 4, y + 32, 56, 48, true);
-  btn_next.SetParams(">", w - 60, y + 32, 56, 48, true);
-  strcpy(file_str_buf, "no job selected");
-  file_str.SetParams(file_str_buf, 70, y + 48, COLOR_WHITE, String::FONT_8x12);
-
-  // --- Row 3: prompt box, two big lines --------------------------------------
-  msg_box.SetParams(4, y + 88, w - 8, 70, COLOR_YELLOW, false);
-  strcpy(msg_line1_buf, "Pick a job file, then press");
-  strcpy(msg_line2_buf, "START JOB");
-  msg_str1.SetParams(msg_line1_buf, 12, y + 98,  COLOR_YELLOW, String::FONT_12x16);
-  msg_str2.SetParams(msg_line2_buf, 12, y + 124, COLOR_YELLOW, String::FONT_12x16);
-
-  // --- Row 4: DRO ------------------------------------------------------------
-  strcpy(dro_x_buf, "X +0.0000");
-  strcpy(dro_a_buf, "A 0.0 turns");
-  dro_x_str.SetParams(dro_x_buf, 8, y + 168, COLOR_GREEN, String::FONT_12x16);
-  dro_a_str.SetParams(dro_a_buf, w / 2, y + 168, COLOR_GREEN, String::FONT_12x16);
-
-  // --- Row 5: STOP (left) and big context button (right) ---------------------
-  btn_stop.SetParams("STOP", 4, y + 196, 120, 60, true);
-  strcpy(btn_main_buf, "START JOB");
-  btn_main.SetParams(btn_main_buf, w / 2, y + 196, w / 2 - 4, 60, true);
-
-  // Register button callbacks the same way ProbeScr does. In stock code the
-  // UiButton delivers presses to the active screen's ProcessCallback() with
-  // the button's address as the pointer argument.
-  btn_prev.SetCallback(AppTask::GetCurrent());
-  btn_next.SetCallback(AppTask::GetCurrent());
-  btn_main.SetCallback(AppTask::GetCurrent());
-  btn_stop.SetCallback(AppTask::GetCurrent());
+  // Prompt frame
+  msg_box.SetParams(BORDER_W, y + 8, w - BORDER_W * 2, 120, COLOR_YELLOW, false);
+  // Prompt texts
+  msg_title.SetParams("WIRE WRAP", BORDER_W + 8, y + 16, COLOR_CYAN,   Font_12x16::GetInstance());
+  msg_line1.SetParams("Press OPEN to pick a job,",  BORDER_W + 8, y + 48, COLOR_YELLOW, Font_12x16::GetInstance());
+  msg_line2.SetParams("then RUN to start.",          BORDER_W + 8, y + 74, COLOR_YELLOW, Font_12x16::GetInstance());
 
   return Result::RESULT_OK;
 }
@@ -227,29 +69,42 @@ Result WrapJobScr::Setup(int32_t y, int32_t height)
 // *****************************************************************************
 Result WrapJobScr::Show()
 {
-  // Receive every line grblHAL sends us (see GrblComm patch)
-  Grbl().SetLineSink(WrapJobScr::GrblLineSink);
+  // Encoder handler for scrolling the file menu
+  InputDrv::GetInstance().AddEncoderCallbackHandler(AppTask::GetCurrent(),
+      reinterpret_cast<CallbackPtr>(ProcessEncoderCallback), this, enc_cble);
 
-  // Z-order: box first, text on top, buttons on top of everything
-  msg_box.Show(100u);
-  state_str.Show(101u);
-  file_str.Show(102u);
-  msg_str1.Show(103u);
-  msg_str2.Show(104u);
-  dro_x_str.Show(105u);
-  dro_a_str.Show(106u);
-  btn_prev.Show(110u);
-  btn_next.Show(111u);
-  btn_main.Show(112u);
-  btn_stop.Show(113u);
+  // Prompt objects
+  msg_box.Show(100);
+  msg_title.Show(101);
+  msg_line1.Show(101);
+  msg_line2.Show(101);
 
-  // Ask the controller for its SD card file list
-  if(GrblInControl())
+  // Axis DRO: reuse Application's shared data windows (same as ProgramSender)
+  for(uint32_t i = 0u; i < grbl_comm.GetLimitedNumberOfAxis(3u); i++)
   {
-    RequestFileList();
+    DataWindow& dw_real = Application::GetInstance().GetRealDataWindow(i);
+    String& dw_real_name = Application::GetInstance().GetRealDataWindowNameString(i);
+
+    dw_real.SetParams(BORDER_W + ((display_drv.GetScreenW() - BORDER_W * 4) / 3 + BORDER_W) * i,
+                      msg_box.GetEndY() + BORDER_W * 2,
+                      (display_drv.GetScreenW() - BORDER_W * 4) / 3,
+                      Font_8x12::GetInstance().GetCharH() * 2u, 8u,
+                      grbl_comm.GetReportUnitsPrecision(i));
+    dw_real.SetBorder(BORDER_W / 2, COLOR_GREY);
+    dw_real.SetDataFont(Font_8x12::GetInstance());
+    dw_real.SetUnits(grbl_comm.GetReportUnits(), DataWindow::RIGHT, Font_6x8::GetInstance());
+    dw_real_name.SetParams(grbl_comm.GetAxisName(i), 0, 0, COLOR_WHITE, Font_6x8::GetInstance());
+    dw_real_name.Move(dw_real.GetStartX() + BORDER_W, dw_real.GetStartY() + BORDER_W);
+    dw_real.Show(100);
+    dw_real_name.Show(100);
   }
 
-  prev_wiz_state = WIZ_ALARM; // force label refresh
+  // Three soft buttons (same sharing scheme as ProgramSender)
+  Application::GetInstance().InitSoftButtons(true);
+  left_btn.SetString("Run");     left_btn.Show(102);
+  middle_btn.SetString("Open");  middle_btn.Show(102);
+  right_btn.SetString("Stop");   right_btn.Show(102);
+
   return Result::RESULT_OK;
 }
 
@@ -258,273 +113,422 @@ Result WrapJobScr::Show()
 // *****************************************************************************
 Result WrapJobScr::Hide()
 {
-  Grbl().SetLineSink(nullptr);
+  InputDrv::GetInstance().DeleteEncoderCallbackHandler(enc_cble);
+
+  // Close any open job file
+  CloseJob();
 
   msg_box.Hide();
-  state_str.Hide();
-  file_str.Hide();
-  msg_str1.Hide();
-  msg_str2.Hide();
-  dro_x_str.Hide();
-  dro_a_str.Hide();
-  btn_prev.Hide();
-  btn_next.Hide();
-  btn_main.Hide();
-  btn_stop.Hide();
+  msg_title.Hide();
+  msg_line1.Hide();
+  msg_line2.Hide();
+
+  for(uint32_t i = 0u; i < GrblComm::AXIS_CNT; i++)
+  {
+    Application::GetInstance().GetRealDataWindow(i).Hide();
+    Application::GetInstance().GetRealDataWindowNameString(i).Hide();
+  }
+
+  left_btn.Hide();
+  middle_btn.Hide();
+  right_btn.Hide();
+
+  // Restore soft button sizes
+  Application::GetInstance().InitSoftButtons(false);
 
   return Result::RESULT_OK;
 }
 
 // *****************************************************************************
-// ***   TimerExpired   ********************************************************
-// ***   Called periodically by the framework (typically every 100 ms).     ***
+// ***   ShowPrompt: update the three prompt strings   *************************
+// *****************************************************************************
+void WrapJobScr::ShowPrompt(const char* title, const char* l1, const char* l2)
+{
+  msg_title.SetString(title);
+  msg_line1.SetString(l1);
+  msg_line2.SetString(l2 ? l2 : "");
+}
+
+// *****************************************************************************
+// ***   SetPromptFromMsgLine: parse "(MSG,....)" into title + 2 lines   *******
+// *****************************************************************************
+void WrapJobScr::SetPromptFromMsgLine(const char* gcode_line)
+{
+  // Find the text after "(MSG,"
+  const char* p = strstr(gcode_line, "(MSG,");
+  if(p == nullptr) return;
+  p += 5; // skip "(MSG,"
+
+  // Copy up to ')' or end into msg_buf
+  uint32_t n = 0u;
+  while((*p != ')') && (*p != '\0') && (*p != '\r') && (*p != '\n') && (n < MSG_BUF - 1u))
+  {
+    msg_buf[n++] = *p++;
+  }
+  msg_buf[n] = '\0';
+
+  // Our job files format prompts as "Step X of 6 - <text>". Split at " - ".
+  char title[24] = "WRAP";
+  char* dash = strstr(msg_buf, " - ");
+  char* body = msg_buf;
+  if(dash != nullptr)
+  {
+    uint32_t tl = (uint32_t)(dash - msg_buf);
+    if(tl > sizeof(title) - 1u) tl = sizeof(title) - 1u;
+    memcpy(title, msg_buf, tl);
+    title[tl] = '\0';
+    body = dash + 3; // skip " - "
+  }
+
+  // Wrap body onto two lines (~28 chars per line at Font_12x16 on 480px)
+  char l1[40] = {0};
+  char l2[40] = {0};
+  uint32_t blen = strlen(body);
+  uint32_t split = blen;
+  if(blen > 28u)
+  {
+    split = 28u;
+    for(uint32_t i = 28u; i > 10u; i--) { if(body[i] == ' ') { split = i; break; } }
+  }
+  uint32_t c1 = (split < sizeof(l1) - 1u) ? split : sizeof(l1) - 1u;
+  memcpy(l1, body, c1); l1[c1] = '\0';
+  if(split < blen)
+  {
+    const char* rest = body + split + ((body[split] == ' ') ? 1u : 0u);
+    strncpy(l2, rest, sizeof(l2) - 1u);
+    l2[sizeof(l2) - 1u] = '\0';
+  }
+
+  ShowPrompt(title, l1, l2);
+}
+
+// *****************************************************************************
+// ***   TimerExpired: run the streaming state machine   **********************
 // *****************************************************************************
 Result WrapJobScr::TimerExpired(uint32_t interval)
 {
-  // --- Disarm STOP confirmation after ~3 s ----------------------------------
-  if(stop_armed > 0u)
+  // Button text: CONTINUE while paused at M0, else Run/Hold as usual
+  if(paused_at_m0 && (grbl_comm.GetState() == GrblComm::HOLD))
   {
-    static uint32_t stop_ms = 0u;
-    stop_ms += interval;
-    if(stop_ms > 3000u)
+    left_btn.SetString("CONTINUE");
+  }
+  else
+  {
+    Application::GetInstance().UpdateLeftButtonText();
+  }
+  Application::GetInstance().UpdateRightButtonText();
+
+  if(run)
+  {
+    // Stream while Idle/Run/Hold and in control
+    if(((grbl_comm.GetState() == GrblComm::IDLE) ||
+        (grbl_comm.GetState() == GrblComm::RUN)  ||
+        (grbl_comm.GetState() == GrblComm::HOLD)) && grbl_comm.IsInControl())
     {
-      stop_armed = 0u;
-      stop_ms = 0u;
-      btn_stop.SetString("STOP"); // alt: btn_stop.SetParams(...) again
+      if(finished)
+      {
+        if(grbl_comm.GetState() == GrblComm::IDLE)
+        {
+          run = false;
+          ShowPrompt("JOB DONE", "Remove rod, load next,", "then RUN again.");
+        }
+      }
+      else if(paused_at_m0)
+      {
+        ; // Wait: operator must tap CONTINUE (handled in ProcessCallback)
+      }
+      else
+      {
+        // Result of previous command
+        GrblComm::status_t result = (id != 0u) ? grbl_comm.GetCmdResult(id) : GrblComm::Status_OK;
+        if((result == GrblComm::Status_OK) || (result == GrblComm::Status_Next_Cmd_Executed))
+        {
+          StreamNextLine();
+        }
+        else if(result == GrblComm::Status_Cmd_Not_Executed_Yet)
+        {
+          ; // wait
+        }
+        else
+        {
+          run = false; // error -> stop
+          ShowPrompt("STOPPED", "Command error.", "Check controller.");
+        }
+      }
+    }
+    else
+    {
+      run = false; // unexpected state -> stop
     }
   }
-
-  // --- Wizard state machine ---------------------------------------------------
-  UpdateStateMachine();
-
-  // --- Step prompt update from RX sink ---------------------------------------
-  if(msg_updated)
+  else
   {
-    msg_updated = false;
-    msg_str1.SetString(msg_line1_buf);
-    msg_str2.SetString(msg_line2_buf);
+    // Not running: allow screen change, handle encoder file scroll
+    Application::GetInstance().EnableScreenChange();
+    if(enc_val != 0) { enc_val = 0; }
   }
-
-  // --- DRO --------------------------------------------------------------------
-  char num[16];
-  FormatFixed(num, sizeof(num), GrblPosX(), 4u);
-  snprintf(dro_x_buf, sizeof(dro_x_buf), "X %s", num);
-  dro_x_str.SetString(dro_x_buf);
-
-  FormatFixed(num, sizeof(num), GrblPosA() / 360.0f, 1u);
-  snprintf(dro_a_buf, sizeof(dro_a_buf), "A %s turns", num);
-  dro_a_str.SetString(dro_a_buf);
 
   return Result::RESULT_OK;
 }
 
 // *****************************************************************************
-// ***   UpdateStateMachine   **************************************************
+// ***   StreamNextLine: read one line, act on it   ***************************
 // *****************************************************************************
-void WrapJobScr::UpdateStateMachine()
+void WrapJobScr::StreamNextLine()
 {
-  GrblSimpleState gs = GrblState();
+  if(!file_open) { finished = true; return; }
 
-  if(!GrblInControl())              wiz_state = WIZ_NO_CTRL;
-  else if(gs == GS_ALARM)           wiz_state = WIZ_ALARM;
-  else if(gs == GS_HOLD)            wiz_state = WIZ_PAUSED;
-  else if(gs == GS_RUN)             {wiz_state = WIZ_RUNNING; job_active = true;}
-  else if(gs == GS_IDLE)
+  char line[LINE_BUF] = {0};
+
+  // Read next non-empty line
+  for(;;)
   {
-    if(job_active)
+    if(f_gets(line, NumberOf(line), &job_file) == nullptr)
     {
-      // Job was running and controller is idle again -> finished (M30)
-      wiz_state = WIZ_DONE;
-      job_active = false;
+      finished = true;   // end of file
+      return;
     }
-    else if(wiz_state != WIZ_DONE) // stay on DONE until operator acts
+    line[NumberOf(line) - 1] = '\0';
+
+    // Guard against over-long lines (same limit ProgramSender enforces)
+    if(strlen(line) > 80u + 2u)
     {
-      wiz_state = (file_idx >= 0) ? WIZ_READY : WIZ_NO_FILE;
+      run = false;
+      finished = true;
+      ShowPrompt("STOPPED", "Line >80 chars.", "Fix the job file.");
+      return;
     }
-    else
+
+    // Trim trailing CR/LF
+    uint32_t l = strlen(line);
+    while(l && ((line[l-1] == '\r') || (line[l-1] == '\n'))) line[--l] = '\0';
+
+    // Skip blank lines and pure comments starting with ';'
+    if(l == 0u) continue;
+    if(line[0] == ';') continue;
+    break;
+  }
+
+  // If this line carries a step prompt, show it (pendant streams it, so we
+  // know the step the moment we send it - no controller echo needed)
+  if(strstr(line, "(MSG,") != nullptr)
+  {
+    SetPromptFromMsgLine(line);
+  }
+
+  // Detect an M0 program pause (word M0 not part of M0x). After sending it the
+  // controller enters HOLD; we wait for the operator to tap CONTINUE.
+  bool is_m0 = false;
+  {
+    const char* m = line;
+    while((m = strchr(m, 'M')) != nullptr)
     {
-      ; // remain in WIZ_DONE
+      if((m[1] == '0') && !isdigit((unsigned char)m[2])) { is_m0 = true; break; }
+      m++;
     }
   }
-  else
-  {
-    ; // GS_OTHER / GS_UNKNOWN: keep current wizard state
-  }
 
-  if(wiz_state != prev_wiz_state)
+  // Send the line (append CR, like ProgramSender)
+  char cmd[LINE_BUF + 2u];
+  snprintf(cmd, NumberOf(cmd), "%s\r", line);
+  if(grbl_comm.SendCmd(cmd, id) == Result::RESULT_OK)
   {
-    prev_wiz_state = wiz_state;
-    UpdateLabels();
+    if(is_m0) paused_at_m0 = true;
   }
 }
 
 // *****************************************************************************
-// ***   UpdateLabels   ********************************************************
+// ***   OpenFileList: enumerate .nc/.gc files on SD (as ProgramSender does)  *
 // *****************************************************************************
-void WrapJobScr::UpdateLabels()
+void WrapJobScr::OpenFileList()
 {
-  const char* state_txt = "";
-  const char* main_txt  = "";
+  AppTask::GetCurrent()->StopTimer();
 
-  switch(wiz_state)
+  CloseJob();
+  BSP_SD_Init();
+
+  FRESULT res = f_mount(&SDFatFS, (TCHAR const*)SDPath, 0);
+  DIR dir;
+  if(res == FR_OK) res = f_opendir(&dir, "/");
+
+  uint32_t idx = 0u;
+  if(res == FR_OK)
   {
-    case WIZ_NO_CTRL:
-      state_txt = "PENDANT OFF";
-      main_txt  = "TAKE CTRL";
-      strcpy(msg_line1_buf, "Pendant is not in control.");
-      strcpy(msg_line2_buf, "Press TAKE CTRL (or MPG button).");
-      msg_updated = true;
-      break;
-    case WIZ_NO_FILE:
-      state_txt = "NO JOB FILES";
-      main_txt  = "REFRESH";
-      strcpy(msg_line1_buf, "No .nc files found on the");
-      strcpy(msg_line2_buf, "controller SD card.");
-      msg_updated = true;
-      break;
-    case WIZ_READY:
-      state_txt = "READY";
-      main_txt  = "START JOB";
-      strcpy(msg_line1_buf, "Check wire spool and rod,");
-      strcpy(msg_line2_buf, "then press START JOB.");
-      msg_updated = true;
-      break;
-    case WIZ_RUNNING:
-      state_txt = "WRAPPING";
-      main_txt  = "HOLD";
-      break;
-    case WIZ_PAUSED:
-      state_txt = "OPERATOR STEP";
-      main_txt  = "CONTINUE";
-      // msg lines already show the (MSG,...) prompt from the job file
-      break;
-    case WIZ_DONE:
-      state_txt = "JOB DONE";
-      main_txt  = "RUN AGAIN";
-      strcpy(msg_line1_buf, "Remove rod and load the next");
-      strcpy(msg_line2_buf, "one, then press RUN AGAIN.");
-      msg_updated = true;
-      break;
-    case WIZ_ALARM:
-      state_txt = "ALARM";
-      main_txt  = "UNLOCK";
-      strcpy(msg_line1_buf, "Machine alarm. Clear the fault,");
-      strcpy(msg_line2_buf, "then press UNLOCK and re-zero.");
-      msg_updated = true;
-      break;
-    default:
-      break;
-  }
+    FILINFO fno;
+    for(;;)
+    {
+      res = f_readdir(&dir, &fno);
+      if((res != FR_OK) || (fno.fname[0] == 0)) break;
 
-  snprintf(state_str_buf, sizeof(state_str_buf), "%s", state_txt);
-  state_str.SetString(state_str_buf);
-  snprintf(btn_main_buf, sizeof(btn_main_buf), "%s", main_txt);
-  btn_main.SetString(btn_main_buf); // alt: re-run btn_main.SetParams(...)
+      // Match .nc* / .gc* extension (same logic as ProgramSender)
+      bool add_file = false;
+      uint32_t i = 0u;
+      for(; i < NumberOf(fno.fname); i++) if(fno.fname[i] == '\0') break;
+      for(i -= ((i >= 3u) ? 3u : 0u); i > 0; i--)
+      {
+        if((fno.fname[i] == '.') && (tolower(fno.fname[i+2]) == 'c'))
+        {
+          if((tolower(fno.fname[i+1]) == 'g') || (tolower(fno.fname[i+1]) == 'n'))
+          {
+            add_file = true; break;
+          }
+        }
+      }
+      if(!(fno.fattrib & AM_DIR) && add_file)
+      {
+        menu_items[idx].str.SetString(menu_items[idx].text, menu_items[idx].n, "%-19.19s%12lub", fno.fname, fno.fsize);
+        idx++;
+        if(idx == NumberOf(menu_items))
+        {
+          menu_items[idx - 1u].str.SetString(menu_items[idx - 1u].text, menu_items[idx - 1u].n, "-- Too many files! --");
+          break;
+        }
+      }
+    }
+    f_closedir(&dir);
+  }
+  for(uint32_t i = idx; i < NumberOf(menu_items); i++) str[i][0] = '\0';
+
+  AppTask::GetCurrent()->StartTimer();
+
+  // Swap prompt view for menu
+  msg_box.Hide(); msg_title.Hide(); msg_line1.Hide(); msg_line2.Hide();
+  left_btn.Hide(); middle_btn.Hide(); right_btn.Hide();
+  menu.SetCount(idx);
+  menu.Show(100);
 }
 
 // *****************************************************************************
-// ***   ProcessCallback   *****************************************************
+// ***   CloseJob   ************************************************************
+// *****************************************************************************
+void WrapJobScr::CloseJob()
+{
+  if(file_open)
+  {
+    f_close(&job_file);
+    file_open = false;
+  }
+  run = false;
+  finished = false;
+  paused_at_m0 = false;
+  id = 0u;
+}
+
+// *****************************************************************************
+// ***   ProcessCallback: soft button handling   ******************************
 // *****************************************************************************
 Result WrapJobScr::ProcessCallback(const void* ptr)
 {
-  if(ptr == &btn_main)
+  Result result = Result::RESULT_OK;
+
+  if(ptr == &left_btn)
   {
-    HandleMainButton();
-  }
-  else if(ptr == &btn_stop)
-  {
-    if(stop_armed == 0u)
+    // CONTINUE from an M0 pause
+    if(paused_at_m0 && (grbl_comm.GetState() == GrblComm::HOLD))
     {
-      stop_armed = 1u;
-      btn_stop.SetString("SURE?");
+      paused_at_m0 = false;
+      grbl_comm.Run();     // ~  resume; streaming continues next tick
+    }
+    // Start the job (only from Idle, with a file open)
+    else if(!run && file_open && grbl_comm.IsInControl() && (grbl_comm.GetState() == GrblComm::IDLE))
+    {
+      id = 0u;
+      run = true;
+      finished = false;
+      paused_at_m0 = false;
+      Application::GetInstance().DisableScreenChange();
     }
     else
     {
-      stop_armed = 0u;
-      btn_stop.SetString("STOP");
-      GrblReset();           // soft reset: kills job immediately
-      job_active = false;
-      wiz_state = WIZ_NO_CTRL;
-      prev_wiz_state = WIZ_ALARM; // force refresh next tick
+      result = Result::ERR_UNHANDLED_REQUEST; // let Application do Run/Hold
     }
   }
-  else if((ptr == &btn_prev) || (ptr == &btn_next))
+  else if(ptr == &right_btn)
   {
-    if((file_cnt > 0u) && (wiz_state != WIZ_RUNNING) && (wiz_state != WIZ_PAUSED))
-    {
-      if(ptr == &btn_next) file_idx = (file_idx + 1) % (int32_t)file_cnt;
-      else file_idx = (file_idx + (int32_t)file_cnt - 1) % (int32_t)file_cnt;
-      snprintf(file_str_buf, sizeof(file_str_buf), "%s", file_names[file_idx]);
-      file_str.SetString(file_str_buf);
-      if(wiz_state == WIZ_DONE) {wiz_state = WIZ_READY; prev_wiz_state = WIZ_ALARM;}
-    }
+    CloseJob();
+    Application::GetInstance().EnableScreenChange();
+    result = Result::ERR_UNHANDLED_REQUEST; // let Application do Stop/Reset
+  }
+  else if((ptr == &middle_btn) && middle_btn.IsActive())
+  {
+    OpenFileList();
   }
   else
   {
-    ; // not our object
+    ; // Do nothing - MISRA rule
   }
+
+  return result;
+}
+
+// *****************************************************************************
+// ***   ProcessMenuOkCallback: a file was chosen   ***************************
+// *****************************************************************************
+Result WrapJobScr::ProcessMenuOkCallback(WrapJobScr* obj_ptr, void* ptr)
+{
+  if(obj_ptr == nullptr) return Result::ERR_NULL_PTR;
+  WrapJobScr& ths = *obj_ptr;
+
+  ths.menu.Hide();
+
+  // Extract filename (trim trailing spaces) - same as ProgramSender
+  char fn[20u] = {0};
+  for(uint32_t i = 0u; i < NumberOf(fn); i++)
+  {
+    fn[i] = ths.menu_items[(uint32_t)ptr].text[i];
+    if(fn[i] == '\0') break;
+  }
+  fn[NumberOf(fn) - 1] = '\0';
+  for(uint32_t i = NumberOf(fn) - 1u; i > 0u; i--)
+  {
+    if(fn[i] <= ' ') fn[i] = '\0'; else break;
+  }
+
+  // Open the job file for line-by-line streaming
+  ths.CloseJob();
+  FRESULT fres = f_open(&ths.job_file, fn, FA_OPEN_EXISTING | FA_READ);
+  if(fres == FR_OK)
+  {
+    ths.file_open = true;
+    ths.ShowPrompt("READY", "Job loaded.", "Press RUN to start.");
+  }
+  else
+  {
+    ths.ShowPrompt("ERROR", "Could not open file.", "");
+  }
+
+  // Restore prompt view
+  ths.msg_box.Show(100); ths.msg_title.Show(101);
+  ths.msg_line1.Show(101); ths.msg_line2.Show(101);
+  ths.left_btn.Show(102); ths.middle_btn.Show(102); ths.right_btn.Show(102);
 
   return Result::RESULT_OK;
 }
 
 // *****************************************************************************
-// ***   HandleMainButton   ****************************************************
+// ***   ProcessMenuCancelCallback   ******************************************
 // *****************************************************************************
-void WrapJobScr::HandleMainButton()
+Result WrapJobScr::ProcessMenuCancelCallback(WrapJobScr* obj_ptr, void* ptr)
 {
-  switch(wiz_state)
-  {
-    case WIZ_NO_CTRL:
-      GrblGainControl();
-      RequestFileList();
-      break;
-    case WIZ_NO_FILE:
-      RequestFileList();
-      break;
-    case WIZ_READY:
-    case WIZ_DONE:
-      StartSelectedJob();
-      break;
-    case WIZ_RUNNING:
-      GrblFeedHold();
-      break;
-    case WIZ_PAUSED:
-      GrblCycleStart();
-      break;
-    case WIZ_ALARM:
-      GrblSendCmd("$X");
-      break;
-    default:
-      break;
-  }
+  if(obj_ptr == nullptr) return Result::ERR_NULL_PTR;
+  WrapJobScr& ths = *obj_ptr;
+
+  ths.menu.Hide();
+  ths.ShowPrompt("WIRE WRAP", "Open cancelled.", "Press OPEN to pick a job.");
+  ths.msg_box.Show(100); ths.msg_title.Show(101);
+  ths.msg_line1.Show(101); ths.msg_line2.Show(101);
+  ths.left_btn.Show(102); ths.middle_btn.Show(102); ths.right_btn.Show(102);
+
+  return Result::RESULT_OK;
 }
 
 // *****************************************************************************
-// ***   RequestFileList   *****************************************************
+// ***   ProcessEncoderCallback: scroll file menu   ***************************
 // *****************************************************************************
-void WrapJobScr::RequestFileList()
+Result WrapJobScr::ProcessEncoderCallback(WrapJobScr* obj_ptr, void* ptr)
 {
-  file_cnt = 0u;
-  file_idx = -1;
-  strcpy(file_str_buf, "listing...");
-  file_str.SetString(file_str_buf);
-  GrblSendCmd("$F"); // grblHAL sdcard plugin: list files -> [FILE:...] lines
-}
-
-// *****************************************************************************
-// ***   StartSelectedJob   ****************************************************
-// *****************************************************************************
-void WrapJobScr::StartSelectedJob()
-{
-  if((file_idx < 0) || (file_idx >= (int32_t)file_cnt)) return;
-
-  char cmd[MAX_FNAME + 8u];
-  snprintf(cmd, sizeof(cmd), "$F=/%s", file_names[file_idx]);
-
-  strcpy(msg_line1_buf, "Starting job...");
-  msg_line2_buf[0] = '\0';
-  msg_updated = true;
-
-  job_active = false;   // set true once state reports RUN
-  GrblSendCmd(cmd);     // grblHAL runs the file from its own SD card
+  if(obj_ptr == nullptr) return Result::ERR_NULL_PTR;
+  WrapJobScr& ths = *obj_ptr;
+  ths.enc_val += (int32_t)ptr;
+  return Result::RESULT_OK;
 }
