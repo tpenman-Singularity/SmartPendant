@@ -520,6 +520,8 @@ void Application::InitHeader()
   }
   header.SetText(scr_cnt, "GCODE SENDER", Font_12x16::GetInstance());
   scr[scr_cnt++] = &ProgramSender::GetInstance();
+  header.SetText(scr_cnt, "WIRE WRAP", Font_12x16::GetInstance());
+  scr[scr_cnt++] = &WrapJobScr::GetInstance();
   header.SetText(scr_cnt, "GCODE GENERATOR", Font_12x16::GetInstance());
   scr[scr_cnt++] = &GCodeGeneratorScr::GetInstance();
   // Probing available only for mill
