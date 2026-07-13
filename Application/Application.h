@@ -40,6 +40,7 @@
 #include "ProbeScr.h"
 #include "GCodeGeneratorScr.h"
 #include "SettingsScr.h"
+#include "WrapJobScr.h"
 
 // *****************************************************************************
 // ***   Local const variables   ***********************************************
