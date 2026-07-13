@@ -28,6 +28,7 @@
 #include "InputDrv.h"
 #include "Menu.h"
 #include "TextBox.h"
+#include "fatfs.h"   // FatFS types (FIL) used by the streamed job file
 
 // *****************************************************************************
 // ***   WrapJobScr Class   ****************************************************
