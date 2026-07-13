@@ -1,22 +1,17 @@
 //******************************************************************************
 //  @file WrapJobScr.h
-//  @brief Wire Wrap guided-job screen for SmartPendant (grblHAL)
+//  @brief Wire Wrap guided-job screen for SmartPendant (grblHAL) - header
 //
-//  Purpose: one-screen operator workflow for a 2-axis (X + A) wire winding
-//  machine. The job sequence itself lives in a .nc file on the CONTROLLER's
-//  SD card (Teensy 4.1 slot). The file contains M0 pauses with (MSG,...)
-//  prompts. This screen:
-//    - lists job files on the controller SD ($F)
-//    - starts a job ($F=<name>)
-//    - shows the current step prompt ([MSG:...] lines from grblHAL)
-//    - shows big X / A-turns DRO and machine state
-//    - drives the job with one big context button:
-//        READY -> START JOB, RUN -> HOLD, HOLD -> CONTINUE,
-//        DONE -> RUN AGAIN, ALARM -> UNLOCK
+//  Hybrid design: the pendant streams the .nc job file line-by-line from the
+//  SD card (exactly like ProgramSender does), and because IT is the one
+//  sending each line, it can show the step prompt the moment it streams a
+//  line that starts with "(MSG,". Lines with M0 make the controller pause;
+//  the operator taps the big CONTINUE button (which just sends Run/~).
 //
-//  This file follows the structure of the stock SmartPendant screens
-//  (ProbeScr / ProgramSender). If the IScr interface signatures in your
-//  checkout differ, match them to whatever ProbeScr.h declares.
+//  This needs ZERO changes to GrblComm. It reuses the same streaming pattern,
+//  SD access (fatfs), and soft-button sharing that ProgramSender uses.
+//
+//  Structure mirrors ProgramSender.h so it matches the real IScreen API.
 //******************************************************************************
 
 #ifndef WrapJobScr_h
@@ -25,23 +20,25 @@
 // *****************************************************************************
 // ***   Includes   ************************************************************
 // *****************************************************************************
-#include "DevCfg.h"        // Project-wide config (display, colors, fonts)
-#include "DisplayDrv.h"    // DevCore display driver (String, Box, ...)
-#include "UiEngine.h"      // DevCore UI (UiButton). If the project keeps
-                           // UiButton elsewhere, include that header instead.
-#include "IScr.h"          // Screen interface used by all SmartPendant screens
-#include "GrblComm.h"      // grblHAL communication task (singleton)
+#include "DevCore.h"
+
+#include "IScreen.h"
+#include "DataWindow.h"
+#include "GrblComm.h"
+#include "InputDrv.h"
+#include "Menu.h"
+#include "TextBox.h"
 
 // *****************************************************************************
-// ***   WrapJobScr   **********************************************************
+// ***   WrapJobScr Class   ****************************************************
 // *****************************************************************************
-class WrapJobScr : public IScr
+class WrapJobScr : public IScreen
 {
   public:
-    // *** Get singleton instance *********************************************
+    // *** Get Instance ********************************************************
     static WrapJobScr& GetInstance();
 
-    // *** Screen interface (match signatures used by ProbeScr) ***************
+    // *** IScreen interface (same signatures as ProgramSender) ***************
     virtual Result Setup(int32_t y, int32_t height);
     virtual Result Show();
     virtual Result Hide();
@@ -49,80 +46,69 @@ class WrapJobScr : public IScr
     virtual Result ProcessCallback(const void* ptr);
 
   private:
-    // Max job files shown from the controller SD card
-    static const uint32_t MAX_FILES = 10u;
-    // Max stored filename length ("/WRAP01.NC" style - keep names short)
-    static const uint32_t MAX_FNAME = 28u;
-    // Step prompt: two display lines
-    static const uint32_t MSG_LINE_LEN = 42u;
+    static const uint8_t  BORDER_W = 4u;
+    // Max job files listed from SD
+    static const uint32_t MAX_FILES = 32u;
+    // Line buffer (matches ProgramSender's 80+CRLF+slack convention)
+    static const uint32_t LINE_BUF = 128u;
+    // On-screen step-prompt buffer
+    static const uint32_t MSG_BUF = 96u;
 
-    // *** Wizard state machine ***********************************************
-    enum WizState
-    {
-      WIZ_NO_CTRL,     // pendant not in control (MPG mode off)
-      WIZ_NO_FILE,     // in control, no file list yet / none selected
-      WIZ_READY,       // file selected, machine idle
-      WIZ_RUNNING,     // job streaming from controller SD
-      WIZ_PAUSED,      // M0 hold - operator step in progress
-      WIZ_DONE,        // job finished (M30 reached)
-      WIZ_ALARM        // grblHAL alarm state
-    };
+    // *** Wizard / streaming state *******************************************
+    bool run = false;        // currently streaming
+    bool finished = false;   // reached end of file
+    bool paused_at_m0 = false; // last streamed line was M0 -> waiting operator
+    uint32_t id = 0u;        // current command id (for GetCmdResult)
 
-    // *** Private data *******************************************************
-    WizState wiz_state = WIZ_NO_CTRL;
-    WizState prev_wiz_state = WIZ_ALARM; // force first redraw
+    // Currently open job file (streamed line-by-line, never fully buffered,
+    // so long wrap files don't need a big RAM allocation)
+    FIL job_file;
+    bool file_open = false;
 
-    // Job file list (parsed from "[FILE:" lines)
-    char file_names[MAX_FILES][MAX_FNAME];
-    uint32_t file_cnt = 0u;
-    int32_t  file_idx = -1;
-    bool list_requested = false;
+    // Current step-prompt text shown big on screen
+    char msg_buf[MSG_BUF] = {0};
 
-    // Step prompt lines (parsed from "[MSG:" lines)
-    char msg_line1_buf[MSG_LINE_LEN];
-    char msg_line2_buf[MSG_LINE_LEN];
-    volatile bool msg_updated = false;
+    // *** SD file menu (same pattern as ProgramSender) ***********************
+    char str[MAX_FILES][32u + 1u] = {0};
+    Menu::MenuItem menu_items[MAX_FILES];
+    Menu menu;
 
-    // Set true between job start and IDLE-after-run, used to detect DONE
-    bool job_active = false;
-    // Stop button needs a second press to confirm
-    uint8_t stop_armed = 0u;
+    // *** Visual objects *****************************************************
+    // Big step-prompt lines
+    String  msg_title;   // e.g. "STEP 3 OF 6"
+    String  msg_line1;   // prompt text line 1
+    String  msg_line2;   // prompt text line 2
+    Box     msg_box;     // frame around the prompt
 
-    // String buffers for on-screen text
-    char state_str_buf[24];
-    char file_str_buf[MAX_FNAME + 4];
-    char dro_x_buf[20];
-    char dro_a_buf[24];
-    char btn_main_buf[16];
+    // Shared soft buttons (owned by Application, like ProgramSender)
+    UiButton& left_btn;    // CONTINUE / RUN
+    UiButton& middle_btn;  // OPEN (pick job file)
+    UiButton& right_btn;   // STOP
 
-    // *** Visual objects (DevCore) *******************************************
-    String state_str;   // big machine/wizard state banner
-    String msg_str1;    // step prompt line 1
-    String msg_str2;    // step prompt line 2
-    String file_str;    // selected job name
-    String dro_x_str;   // X position
-    String dro_a_str;   // A position shown as turns
-    Box    msg_box;     // frame around the prompt area
+    // Axis DRO reuses Application's shared data windows in Show()
 
-    UiButton btn_prev;  // previous file
-    UiButton btn_next;  // next file
-    UiButton btn_main;  // big context action button
-    UiButton btn_stop;  // stop/reset (press twice)
+    // Instances
+    DisplayDrv& display_drv = DisplayDrv::GetInstance();
+    GrblComm&   grbl_comm   = GrblComm::GetInstance();
 
-    // Screen area given by the framework
-    int32_t scr_y = 0;
-    int32_t scr_h = 0;
+    // Encoder callback entry (for scrolling file menu)
+    InputDrv::CallbackListEntry enc_cble;
+    int32_t enc_val = 0;
 
-    // *** Private functions **************************************************
-    void UpdateStateMachine();
-    void UpdateLabels();
-    void RequestFileList();
-    void StartSelectedJob();
-    void HandleMainButton();
-    static void GrblLineSink(const char* line); // hooked into GrblComm RX
+    // *** Private helpers ****************************************************
+    void   ShowPrompt(const char* title, const char* l1, const char* l2);
+    void   StreamNextLine();
+    void   SetPromptFromMsgLine(const char* gcode_line); // parse "(MSG,...)"
+    void   OpenFileList();
+    void   CloseJob();
 
-    // Singleton: private constructor and no copies
-    WrapJobScr() {};
+    // Menu callbacks (same static-callback pattern as ProgramSender)
+    static Result ProcessMenuOkCallback(WrapJobScr* obj_ptr, void* ptr);
+    static Result ProcessMenuCancelCallback(WrapJobScr* obj_ptr, void* ptr);
+    static Result ProcessEncoderCallback(WrapJobScr* obj_ptr, void* ptr);
+
+    // Singleton: constructor grabs the shared soft buttons like ProgramSender
+    WrapJobScr();
     WrapJobScr(WrapJobScr const&) = delete;
     void operator=(WrapJobScr const&) = delete;
 };
